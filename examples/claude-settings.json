@@ -1,0 +1,22 @@
+{
+  "forest": {
+    "project-name": "my-app",
+    "compose-file": "docker-compose.yml",
+    "hooks": {
+      "pre": [],
+      "pre-services": ["npm install"],
+      "post": []
+    },
+    "services": {
+      "dev": {
+        "cmd": "npm run dev -- --port 3000",
+        "label": "Dev Server",
+        "port": 3000
+      }
+    },
+    "urls": {
+      "App": "http://localhost:3000"
+    },
+    "branch-pattern": "^(feat|feature|bugfix|fix|chore|hotfix)/(\\d+)?-?(.+)$"
+  }
+}

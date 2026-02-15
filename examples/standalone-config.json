@@ -1,0 +1,26 @@
+{
+  "project-name": "my-app",
+  "compose-file": "docker-compose.yml",
+  "hooks": {
+    "pre": ["scripts/setup-db.sh"],
+    "pre-services": [],
+    "post": ["scripts/seed-data.sh"]
+  },
+  "services": {
+    "frontend": {
+      "cmd": "cd client && yarn dev",
+      "label": "React Dev Server",
+      "port": 3000
+    },
+    "worker": {
+      "cmd": "cd worker && python main.py",
+      "label": "Background Worker"
+    }
+  },
+  "urls": {
+    "App": "http://localhost:3000",
+    "API": "http://localhost:8080",
+    "Docs": "http://localhost:3000/docs"
+  },
+  "branch-pattern": "^(feat|feature|bugfix|fix|chore|hotfix)/(\\d+)?-?(.+)$"
+}

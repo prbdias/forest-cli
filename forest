@@ -1,0 +1,1652 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# 🌲 forest -- Dev workspace switcher for git worktrees
+#
+# Bridges git worktrees, Docker Compose, and host services so multiple
+# AI coding agents can work in parallel worktrees
+# while you test one at a time.
+#
+# https://github.com/prbdias/forest-cli
+#
+# Hard requirements:
+#   - bash 3.2+
+#   - git (with worktree support)
+#   - docker + docker compose v2
+#   - jq (JSON parsing)
+#
+# Config (auto-detected, in priority order):
+#   1. .cursor/worktrees.json  → "forest" key
+#   2. .claude/settings.json   → "forest" key
+#   3. .forest/config.json     → root level (standalone)
+#
+# Usage: forest [command] [args]
+#   forest              Interactive boot menu (default)
+#   forest init         Setup wizard -- configure project
+#   forest doctor       Check all requirements
+#   forest list         List worktrees with branch/issue info
+#   forest boot [name]  Boot dev stack for a worktree
+#   forest stop         Stop the active dev stack
+#   forest switch [name] Stop current + boot another
+#   forest status       Show running state
+#   forest logs [svc]   Tail logs (docker + host services)
+#   forest label [n] [l] Set a label for a worktree
+#   forest cleanup [n]  Tear down worktree resources
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+VERSION="0.1.0"
+
+# ── Colors & formatting ─────────────────────────────────────────────────────
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+MAGENTA='\033[0;35m'
+DIM='\033[2m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+# Box-drawing
+BOX_TL='╭' BOX_TR='╮' BOX_BL='╰' BOX_BR='╯' BOX_V='│'
+# shellcheck disable=SC2034  # BOX_H used in dynamic box-drawing
+BOX_H='─'
+
+# Portable lowercase (works on bash 3.2 / macOS)
+lc() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+
+log_info()    { echo -e "  ${BLUE}▸${NC} $1"; }
+log_success() { echo -e "  ${GREEN}✓${NC} $1"; }
+log_warn()    { echo -e "  ${YELLOW}▹${NC} $1"; }
+log_error()   { echo -e "  ${RED}✗${NC} $1"; }
+
+# Print a boxed header
+print_header() {
+    local title="$1"
+    local width=62
+    local pad=$(( width - ${#title} - 2 ))
+    echo ""
+    echo -e "  ${DIM}${BOX_TL}$(printf '%0.s─' $(seq 1 $width))${BOX_TR}${NC}"
+    echo -e "  ${DIM}${BOX_V}${NC}  ${BOLD}${title}${NC}$(printf '%*s' $pad '')${DIM}${BOX_V}${NC}"
+    echo -e "  ${DIM}${BOX_BL}$(printf '%0.s─' $(seq 1 $width))${BOX_BR}${NC}"
+    echo ""
+}
+
+# Print a separator line
+print_sep() {
+    echo -e "  ${DIM}$(printf '%0.s─' $(seq 1 62))${NC}"
+}
+
+# ── Project detection ────────────────────────────────────────────────────────
+
+# Walk up from $PWD to find project root (directory containing .git)
+# shellcheck disable=SC2120  # accepts optional $1 but callers use default
+find_project_root() {
+    local dir="${1:-$PWD}"
+    while [[ "$dir" != "/" ]]; do
+        if [[ -d "$dir/.git" ]] || [[ -f "$dir/.git" ]]; then
+            echo "$dir"
+            return 0
+        fi
+        dir="$(dirname "$dir")"
+    done
+    return 1
+}
+
+# Find the main worktree (the one that owns .git/ as a directory, not a file)
+find_main_root() {
+    local project_root="$1"
+    # If .git is a directory, this IS the main worktree
+    if [[ -d "$project_root/.git" ]]; then
+        echo "$project_root"
+        return 0
+    fi
+    # If .git is a file (worktree), parse it to find the main worktree
+    if [[ -f "$project_root/.git" ]]; then
+        local gitdir
+        gitdir="$(head -1 "$project_root/.git" | sed 's/^gitdir: //')"
+        # gitdir might be absolute or relative
+        if [[ "$gitdir" != /* ]]; then
+            gitdir="$project_root/$gitdir"
+        fi
+        # gitdir points to something like /main/repo/.git/worktrees/xyz
+        # The main repo root is the parent of the .git directory
+        # Navigate: .git/worktrees/xyz -> .git (2 levels up) -> parent of .git
+        local main_git_dir
+        main_git_dir="$(cd "$gitdir/../.." 2>/dev/null && pwd)"
+        # main_git_dir is now /main/repo/.git -- go up one more for the repo root
+        local main_root
+        main_root="$(dirname "$main_git_dir")"
+        echo "$main_root"
+        return 0
+    fi
+    return 1
+}
+
+# Get the project name from config or directory name
+get_project_name() {
+    local main_root="$1"
+    local config
+    config="$(find_config "$main_root" 2>/dev/null)" || { basename "$main_root"; return; }
+    local prefix
+    prefix="$(config_prefix)"
+
+    local name
+    name="$(jq -r "${prefix}.\"project-name\" // empty" "$config" 2>/dev/null || true)"
+    if [[ -n "$name" ]]; then
+        echo "$name"
+    else
+        basename "$main_root"
+    fi
+}
+
+# ── Worktree metadata persistence ────────────────────────────────────────────
+
+# shellcheck disable=SC2034  # META_FILE used indirectly via meta_get/meta_set
+META_FILE=""
+
+# Read a value from .forest/meta.json
+meta_get() {
+    local main_root="$1" wt_name="$2" key="$3"
+    local meta="$main_root/.forest/meta.json"
+    if [[ -f "$meta" ]]; then
+        jq -r ".\"$wt_name\".\"$key\" // empty" "$meta" 2>/dev/null || true
+    fi
+}
+
+# Write a value to .forest/meta.json (creates file if needed)
+meta_set() {
+    local main_root="$1" wt_name="$2" key="$3" value="$4"
+    mkdir -p "$main_root/.forest"
+    local meta="$main_root/.forest/meta.json"
+    if [[ -f "$meta" ]]; then
+        local tmp
+        tmp="$(jq --arg n "$wt_name" --arg k "$key" --arg v "$value" \
+            '.[$n] = (.[$n] // {} | .[$k] = $v)' "$meta")"
+        echo "$tmp" > "$meta"
+    else
+        jq -n --arg n "$wt_name" --arg k "$key" --arg v "$value" \
+            '{($n): {($k): $v}}' > "$meta"
+    fi
+}
+
+# ── Worktree discovery ───────────────────────────────────────────────────────
+
+# Declare global arrays for worktree data
+declare -a WT_PATHS=()
+declare -a WT_NAMES=()
+declare -a WT_BRANCHES=()
+declare -a WT_ISSUES=()
+declare -a WT_STATUSES=()
+declare -a WT_LAST_COMMIT=()
+declare -a WT_DIRTY_COUNT=()
+declare -a WT_DETACHED=()
+
+# Parse git worktree list --porcelain and populate arrays
+discover_worktrees() {
+    local main_root="$1"
+
+    WT_PATHS=()
+    WT_NAMES=()
+    WT_BRANCHES=()
+    WT_ISSUES=()
+    WT_STATUSES=()
+    WT_LAST_COMMIT=()
+    WT_DIRTY_COUNT=()
+    WT_DETACHED=()
+
+    local path="" branch="" head_sha="" is_bare=false is_detached=false
+    local active_wt=""
+    if [[ -f "$main_root/.forest/active.json" ]]; then
+        active_wt="$(jq -r '.worktree_path // empty' "$main_root/.forest/active.json" 2>/dev/null || true)"
+    fi
+
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "worktree "* ]]; then
+            path="${line#worktree }"
+        elif [[ "$line" == "HEAD "* ]]; then
+            head_sha="${line#HEAD }"
+        elif [[ "$line" == "branch "* ]]; then
+            branch="${line#branch refs/heads/}"
+        elif [[ "$line" == "detached" ]]; then
+            is_detached=true
+        elif [[ "$line" == "bare" ]]; then
+            is_bare=true
+        elif [[ -z "$line" ]]; then
+            # End of entry -- store it
+            if [[ -n "$path" ]] && ! $is_bare; then
+                local name
+                if [[ "$path" == "$main_root" ]]; then
+                    name="main"
+                else
+                    name="$(basename "$path")"
+                fi
+
+                # Smart branch memory: persist branch when we have one,
+                # recall saved branch when detached
+                if $is_detached; then
+                    # Check for a manual label first, then saved branch
+                    local saved_label
+                    saved_label="$(meta_get "$main_root" "$name" "label")"
+                    local saved_branch
+                    saved_branch="$(meta_get "$main_root" "$name" "branch")"
+
+                    if [[ -n "$saved_label" ]]; then
+                        branch="$saved_label"
+                    elif [[ -n "$saved_branch" ]]; then
+                        branch="~${saved_branch}"
+                    else
+                        # No saved data -- summarize dirty files as context
+                        local changed_files
+                        changed_files="$(cd "$path" 2>/dev/null && git diff --name-only HEAD 2>/dev/null)" || true
+                        local untracked
+                        untracked="$(cd "$path" 2>/dev/null && git ls-files --others --exclude-standard 2>/dev/null)" || true
+                        local all_files="${changed_files}"
+                        [[ -n "$untracked" ]] && all_files="${all_files}${all_files:+$'\n'}${untracked}"
+
+                        if [[ -n "$all_files" ]]; then
+                            # Extract unique top-level dirs/files
+                            local summary
+                            summary="$(echo "$all_files" | sed 's|/.*||' | sort -u | head -3 | tr '\n' ', ' | sed 's/,$//')"
+                            branch="(no branch) $summary"
+                        else
+                            branch="(detached @ ${head_sha:0:8})"
+                        fi
+                    fi
+                else
+                    # Has a live branch -- save it for later recall
+                    meta_set "$main_root" "$name" "branch" "$branch"
+                fi
+
+                # Auto-extract issue number from branch (works on live, saved, or labeled)
+                local issue=""
+                local branch_for_issue="$branch"
+                # Strip ~ prefix for saved branches
+                branch_for_issue="${branch_for_issue#\~}"
+                if [[ "$branch_for_issue" =~ ^(feat|feature|bugfix|fix|chore|hotfix)/([0-9]+) ]]; then
+                    issue="#${BASH_REMATCH[2]}"
+                fi
+
+                # Determine status + count dirty files
+                local status="ready"
+                local dirty_count=0
+                if [[ "$path" == "$active_wt" ]]; then
+                    status="active"
+                fi
+                local porcelain
+                porcelain="$(cd "$path" 2>/dev/null && git status --porcelain 2>/dev/null)" || true
+                if [[ -n "$porcelain" ]]; then
+                    dirty_count=$(echo "$porcelain" | wc -l | tr -d ' ')
+                    if [[ "$status" != "active" ]]; then
+                        status="dirty"
+                    fi
+                fi
+
+                # Get last commit message (short, one line)
+                local last_commit=""
+                last_commit="$(cd "$path" 2>/dev/null && git log -1 --format='%s' 2>/dev/null)" || true
+                # Truncate to 50 chars
+                if (( ${#last_commit} > 50 )); then
+                    last_commit="${last_commit:0:47}..."
+                fi
+
+                WT_PATHS+=("$path")
+                WT_NAMES+=("$name")
+                WT_BRANCHES+=("$branch")
+                WT_ISSUES+=("$issue")
+                WT_STATUSES+=("$status")
+                WT_LAST_COMMIT+=("$last_commit")
+                WT_DIRTY_COUNT+=("$dirty_count")
+                WT_DETACHED+=("$is_detached")
+            fi
+            path="" branch="" head_sha="" is_bare=false is_detached=false
+        fi
+    done < <(git -C "$main_root" worktree list --porcelain 2>/dev/null; echo "")
+}
+
+# ── Branch metadata ──────────────────────────────────────────────────────────
+
+# Extract a human-readable description from a branch name
+branch_description() {
+    local branch="$1"
+    # Remove prefix like feat/13- or feature/
+    local desc="${branch}"
+    desc="${desc#*/}"            # remove everything up to first /
+    desc="${desc#[0-9]*-}"      # remove leading number and dash
+    desc="${desc//-/ }"         # dashes to spaces
+    echo "$desc"
+}
+
+# ── Config reading ───────────────────────────────────────────────────────────
+
+# Cached config file path (resolved once per run)
+_FOREST_CONFIG_FILE=""
+_FOREST_CONFIG_KEY=""
+
+# Detect which config file to use. Checks in order:
+#   1. .cursor/worktrees.json  → "forest" key
+#   2. .claude/settings.json   → "forest" key
+#   3. .forest/config.json     → root level (standalone / any editor)
+# Caches the result for subsequent calls.
+find_config() {
+    local main_root="$1"
+
+    if [[ -n "$_FOREST_CONFIG_FILE" ]]; then
+        echo "$_FOREST_CONFIG_FILE"
+        return 0
+    fi
+
+    # .cursor/worktrees.json with "forest" key
+    local cursor="$main_root/.cursor/worktrees.json"
+    if [[ -f "$cursor" ]] && jq -e '.forest' "$cursor" &>/dev/null; then
+        _FOREST_CONFIG_FILE="$cursor"
+        _FOREST_CONFIG_KEY=".forest"
+        echo "$cursor"
+        return 0
+    fi
+
+    # Claude Code: .claude/settings.json with "forest" key
+    local claude="$main_root/.claude/settings.json"
+    if [[ -f "$claude" ]] && jq -e '.forest' "$claude" &>/dev/null; then
+        _FOREST_CONFIG_FILE="$claude"
+        _FOREST_CONFIG_KEY=".forest"
+        echo "$claude"
+        return 0
+    fi
+
+    # Standalone: .forest/config.json (config at root level)
+    local standalone="$main_root/.forest/config.json"
+    if [[ -f "$standalone" ]]; then
+        _FOREST_CONFIG_FILE="$standalone"
+        _FOREST_CONFIG_KEY="."
+        echo "$standalone"
+        return 0
+    fi
+
+    return 1
+}
+
+# Get the jq prefix for config values (either ".forest" or ".")
+config_prefix() {
+    if [[ -z "$_FOREST_CONFIG_KEY" ]]; then
+        echo ".forest"
+    else
+        echo "$_FOREST_CONFIG_KEY"
+    fi
+}
+
+# Read a value from the forest config
+config_get() {
+    local main_root="$1"
+    local key="$2"
+    local default="${3:-}"
+
+    local config
+    config="$(find_config "$main_root")" || { echo "$default"; return; }
+    local prefix
+    prefix="$(config_prefix)"
+
+    local val
+    val="$(jq -r "${prefix}.\"$key\" // empty" "$config" 2>/dev/null || true)"
+    if [[ -n "$val" ]]; then
+        echo "$val"
+        return
+    fi
+    echo "$default"
+}
+
+# Check if forest config exists
+has_forest_config() {
+    local main_root="$1"
+    find_config "$main_root" &>/dev/null
+}
+
+# Read a raw jq expression from the forest config.
+# Usage: config_jq <main_root> '<jq_expr_after_prefix>'
+# The config prefix (.forest or .) is prepended automatically.
+config_jq() {
+    local main_root="$1"
+    local expr="$2"
+    local config
+    config="$(find_config "$main_root")" || return 1
+    local prefix
+    prefix="$(config_prefix)"
+    jq -r "${prefix}${expr}" "$config" 2>/dev/null || true
+}
+
+# ── Env file resolution ──────────────────────────────────────────────────────
+
+# Resolve the .env file path: prefer worktree copy, fall back to main root.
+# This allows each worktree to carry its own .env with custom overrides while
+# still working when no worktree-level .env exists.
+resolve_env_file() {
+    local workspace_root="$1"
+    local main_root="$2"
+    if [[ -f "$workspace_root/.env" ]]; then
+        echo "$workspace_root/.env"
+    else
+        echo "$main_root/.env"
+    fi
+}
+
+# ── Interactive menu ─────────────────────────────────────────────────────────
+
+# Show the worktree selection menu and return the selected index
+show_menu() {
+    local project_name="$1"
+
+    print_header "forest · ${project_name}"
+
+    # Column headers
+    printf "  ${DIM}%-4s  %-10s  %-36s  %-6s  %-8s${NC}\n" \
+        "#" "Worktree" "Branch" "Issue" "Status"
+    print_sep
+
+    local i
+    for i in "${!WT_NAMES[@]}"; do
+        local status_color="$DIM"
+        case "${WT_STATUSES[$i]}" in
+            active) status_color="$GREEN" ;;
+            dirty)  status_color="$YELLOW" ;;
+            ready)  status_color="$CYAN" ;;
+        esac
+
+        local branch_display="${WT_BRANCHES[$i]}"
+        local issue_display="${WT_ISSUES[$i]}"
+        local status_display="${WT_STATUSES[$i]}"
+        local dirty_count="${WT_DIRTY_COUNT[$i]}"
+
+        # Append file count to status if dirty
+        if (( dirty_count > 0 )); then
+            status_display="${status_display} (${dirty_count})"
+        fi
+
+        printf "  ${BOLD}%-4s${NC}  %-10s  %-36s  ${MAGENTA}%-6s${NC}  ${status_color}%-10s${NC}\n" \
+            "$i" "${WT_NAMES[$i]}" "$branch_display" "$issue_display" "$status_display"
+
+        # Detail line: last commit message (always shown, dimmed)
+        local commit_msg="${WT_LAST_COMMIT[$i]}"
+        if [[ -n "$commit_msg" ]]; then
+            printf "  ${DIM}      ↳ %s${NC}\n" "$commit_msg"
+        fi
+    done
+
+    echo ""
+
+    # Show current active worktree
+    local active_name="none"
+    for i in "${!WT_STATUSES[@]}"; do
+        if [[ "${WT_STATUSES[$i]}" == "active" ]]; then
+            active_name="${WT_NAMES[$i]} ${DIM}(${WT_BRANCHES[$i]})${NC}"
+            break
+        fi
+    done
+    echo -e "  Active: ${GREEN}${active_name}${NC}"
+    echo ""
+}
+
+# Prompt user to select a worktree, returns index on stdout.
+# All UI (menu, prompt) goes to stderr so callers can capture stdout cleanly.
+prompt_worktree() {
+    local project_name="$1"
+    local default_idx="${2:-0}"
+
+    show_menu "$project_name" >&2
+
+    local choice
+    echo -ne "  ${BOLD}Select worktree${NC} [$default_idx]: " >&2
+    if [[ -t 0 ]]; then
+        read -r choice
+    elif [[ -e /dev/tty ]]; then
+        read -r choice < /dev/tty
+    else
+        read -r choice
+    fi
+    choice="${choice:-$default_idx}"
+
+    # Accept number or name
+    if [[ "$choice" =~ ^[0-9]+$ ]]; then
+        if (( choice >= 0 && choice < ${#WT_NAMES[@]} )); then
+            echo "$choice"
+            return 0
+        fi
+    else
+        # Match by name or branch substring
+        for i in "${!WT_NAMES[@]}"; do
+            if [[ "${WT_NAMES[$i]}" == "$choice" ]]; then
+                echo "$i"
+                return 0
+            fi
+        done
+        for i in "${!WT_BRANCHES[@]}"; do
+            if [[ "${WT_BRANCHES[$i]}" == *"$choice"* ]]; then
+                echo "$i"
+                return 0
+            fi
+        done
+    fi
+
+    log_error "Invalid selection: $choice" >&2
+    return 1
+}
+
+# Find worktree index by name (for non-interactive use)
+find_worktree_by_name() {
+    local name="$1"
+    for i in "${!WT_NAMES[@]}"; do
+        if [[ "${WT_NAMES[$i]}" == "$name" ]]; then
+            echo "$i"
+            return 0
+        fi
+    done
+    # Try matching branch substring
+    for i in "${!WT_BRANCHES[@]}"; do
+        if [[ "${WT_BRANCHES[$i]}" == *"$name"* ]]; then
+            echo "$i"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── Docker Compose orchestration ─────────────────────────────────────────────
+
+# Build the docker compose command with proper flags
+compose_cmd() {
+    local main_root="$1"
+    local workspace_root="$2"
+    local project_name="$3"
+    local compose_file
+    compose_file="$(config_get "$main_root" "compose-file" "docker-compose.yml")"
+
+    local env_file
+    env_file="$(resolve_env_file "$workspace_root" "$main_root")"
+
+    echo "docker compose" \
+        "--env-file" "$env_file" \
+        "--project-directory" "$workspace_root" \
+        "-f" "$workspace_root/$compose_file" \
+        "-p" "$project_name"
+}
+
+# Stop docker compose and host services
+do_stop() {
+    local main_root="$1"
+    local active_file="$main_root/.forest/active.json"
+
+    if [[ ! -f "$active_file" ]]; then
+        log_warn "No active environment to stop"
+        return 0
+    fi
+
+    local workspace_root project_name
+    workspace_root="$(jq -r '.worktree_path' "$active_file" 2>/dev/null)"
+    project_name="$(jq -r '.project_name' "$active_file" 2>/dev/null)"
+    local wt_name
+    wt_name="$(jq -r '.worktree_name' "$active_file" 2>/dev/null)"
+
+    log_info "Stopping environment: ${BOLD}${wt_name}${NC}"
+
+    # Stop host services (read PIDs from active file)
+    local pids
+    pids="$(jq -r '.service_pids // {} | to_entries[] | .value' "$active_file" 2>/dev/null || true)"
+    if [[ -n "$pids" ]]; then
+        for pid in $pids; do
+            kill "$pid" 2>/dev/null || true
+        done
+        log_success "Host services stopped"
+    fi
+
+    # Kill any orphaned host service processes started by forest
+    # (the PID-based cleanup above should handle most cases;
+    # this is a safety net for processes that escaped tracking)
+    local svc_keys
+    svc_keys="$(config_jq "$main_root" '.services // {} | keys[]' 2>/dev/null || true)"
+    if [[ -n "$svc_keys" ]]; then
+        while IFS= read -r svc_key; do
+            local svc_cmd_pattern
+            svc_cmd_pattern="$(config_jq "$main_root" ".services.\"$svc_key\".cmd // empty" 2>/dev/null || true)"
+            if [[ -n "$svc_cmd_pattern" ]]; then
+                # Extract a meaningful substring (first two path components) for pkill
+                local pattern_word
+                pattern_word="$(echo "$svc_cmd_pattern" | grep -oE 'cd [^ ]+' | head -1 | sed 's/cd //' || true)"
+                if [[ -n "$pattern_word" ]]; then
+                    pkill -f "${pattern_word}.*vite" 2>/dev/null || true
+                fi
+            fi
+        done <<< "$svc_keys"
+    fi
+
+    # Stop docker compose
+    local compose_file
+    compose_file="$(config_get "$main_root" "compose-file" "docker-compose.yml")"
+
+    if [[ -f "$workspace_root/$compose_file" ]]; then
+        local env_file
+        env_file="$(resolve_env_file "$workspace_root" "$main_root")"
+
+        docker compose \
+            --env-file "$env_file" \
+            --project-directory "$workspace_root" \
+            -f "$workspace_root/$compose_file" \
+            -p "$project_name" \
+            down 2>/dev/null || true
+        log_success "Docker Compose stack stopped"
+    fi
+
+    # Clean up log files
+    rm -rf "$main_root/.forest/logs" 2>/dev/null || true
+
+    rm -f "$active_file"
+    log_success "Environment stopped"
+}
+
+# Boot docker compose + host services for a worktree
+do_boot() {
+    local main_root="$1"
+    local idx="$2"
+    local follow="${3:-false}"
+    local workspace_root="${WT_PATHS[$idx]}"
+    local wt_name="${WT_NAMES[$idx]}"
+    local wt_branch="${WT_BRANCHES[$idx]}"
+    local project_name
+    project_name="$(get_project_name "$main_root")"
+
+    local compose_file
+    compose_file="$(config_get "$main_root" "compose-file" "docker-compose.yml")"
+
+    # Check .env exists in worktree or main root
+    if [[ ! -f "$workspace_root/.env" ]] && [[ ! -f "$main_root/.env" ]]; then
+        log_error ".env file not found in worktree or project root"
+        log_info "Copy .env.example to .env and fill in your values"
+        return 1
+    fi
+
+    # Check compose file exists in the worktree
+    if [[ ! -f "$workspace_root/$compose_file" ]]; then
+        log_error "No $compose_file found in $workspace_root"
+        log_info "Run ${BOLD}forest init${NC} to configure your project"
+        return 1
+    fi
+
+    echo ""
+    log_info "Booting ${BOLD}${wt_name}${NC} ${DIM}(${wt_branch})${NC}"
+    echo ""
+
+    # Run pre-boot hooks
+    local hooks_json
+    hooks_json="$(config_jq "$main_root" '.hooks.pre // [] | .[]')"
+    if [[ -n "$hooks_json" ]]; then
+        while IFS= read -r hook; do
+            local hook_path="$main_root/$hook"
+            if [[ -x "$hook_path" ]]; then
+                log_info "Running pre-boot hook: ${DIM}${hook}${NC}"
+                WORKSPACE_ROOT="$workspace_root" MAIN_ROOT="$main_root" "$hook_path"
+            elif [[ -f "$hook_path" ]]; then
+                log_info "Running pre-boot hook: ${DIM}${hook}${NC}"
+                WORKSPACE_ROOT="$workspace_root" MAIN_ROOT="$main_root" bash "$hook_path"
+            else
+                log_warn "Hook not found: $hook"
+            fi
+        done <<< "$hooks_json"
+    fi
+
+    # Start docker compose
+    log_info "Starting Docker Compose stack..."
+    local env_file
+    env_file="$(resolve_env_file "$workspace_root" "$main_root")"
+
+    docker compose \
+        --env-file "$env_file" \
+        --project-directory "$workspace_root" \
+        -f "$workspace_root/$compose_file" \
+        -p "$project_name" \
+        up -d --build
+
+    log_success "Docker Compose stack running"
+
+    # Prepare active state file
+    local active_data
+    active_data=$(jq -n \
+        --arg wp "$workspace_root" \
+        --arg wn "$wt_name" \
+        --arg wb "$wt_branch" \
+        --arg pn "$project_name" \
+        '{worktree_path: $wp, worktree_name: $wn, worktree_branch: $wb, project_name: $pn, service_pids: {}}')
+
+    # Load .env into current shell so host services inherit the vars
+    # Prefer worktree .env over main root .env
+    local source_env
+    source_env="$(resolve_env_file "$workspace_root" "$main_root")"
+    if [[ -f "$source_env" ]]; then
+        set -a
+        # shellcheck source=/dev/null
+        source "$source_env"
+        set +a
+    fi
+
+    # Run pre-services hooks (sequential, e.g. pnpm install)
+    local pre_svc_hooks
+    pre_svc_hooks="$(config_jq "$main_root" '.hooks."pre-services" // [] | .[]')"
+    if [[ -n "$pre_svc_hooks" ]]; then
+        while IFS= read -r hook_cmd; do
+            log_info "Running: ${DIM}${hook_cmd}${NC}"
+            (cd "$workspace_root" && eval "$hook_cmd")
+        done <<< "$pre_svc_hooks"
+    fi
+
+    # Prepare log directory for host services
+    local log_dir="$main_root/.forest/logs"
+    mkdir -p "$log_dir"
+
+    # Start host services (output goes to log files by default)
+    local services_json
+    services_json="$(config_jq "$main_root" '.services // {} | keys[]')"
+    if [[ -n "$services_json" ]]; then
+        while IFS= read -r svc_key; do
+            local svc_cmd svc_label svc_port
+            svc_cmd="$(config_jq "$main_root" ".services.\"$svc_key\".cmd")"
+            svc_label="$(config_jq "$main_root" ".services.\"$svc_key\".label // \"$svc_key\"")"
+            svc_port="$(config_jq "$main_root" ".services.\"$svc_key\".port // empty")"
+
+            log_info "Starting ${svc_label}..."
+
+            # Run the service command from the workspace root
+            # Output redirected to log file to keep terminal clean
+            (cd "$workspace_root" && eval "$svc_cmd") > "$log_dir/$svc_key.log" 2>&1 &
+            local svc_pid=$!
+
+            # Add PID to active data
+            active_data="$(echo "$active_data" | jq --arg k "$svc_key" --argjson p "$svc_pid" '.service_pids[$k] = $p')"
+
+            if [[ -n "$svc_port" ]]; then
+                log_success "${svc_label} on port ${svc_port} (PID: ${svc_pid})"
+            else
+                log_success "${svc_label} (PID: ${svc_pid})"
+            fi
+        done <<< "$services_json"
+    fi
+
+    # Write active state
+    mkdir -p "$main_root/.forest"
+    echo "$active_data" > "$main_root/.forest/active.json"
+
+    # Run post-boot hooks
+    local post_hooks_json
+    post_hooks_json="$(config_jq "$main_root" '.hooks.post // [] | .[]')"
+    if [[ -n "$post_hooks_json" ]]; then
+        while IFS= read -r hook; do
+            local hook_path="$main_root/$hook"
+            if [[ -x "$hook_path" ]]; then
+                log_info "Running post-boot hook: ${DIM}${hook}${NC}"
+                WORKSPACE_ROOT="$workspace_root" MAIN_ROOT="$main_root" "$hook_path"
+            elif [[ -f "$hook_path" ]]; then
+                log_info "Running post-boot hook: ${DIM}${hook}${NC}"
+                WORKSPACE_ROOT="$workspace_root" MAIN_ROOT="$main_root" bash "$hook_path"
+            else
+                log_warn "Hook not found: $hook"
+            fi
+        done <<< "$post_hooks_json"
+    fi
+
+    # Print summary
+    echo ""
+    print_sep
+    echo ""
+    log_success "Environment ready: ${BOLD}${wt_name}${NC} ${DIM}(${wt_branch})${NC}"
+    echo ""
+
+    # Print configured URLs
+    local urls_json
+    urls_json="$(config_jq "$main_root" '.urls // {} | to_entries[] | "  \(.key): \(.value)"')"
+    if [[ -n "$urls_json" ]]; then
+        echo "$urls_json"
+        echo ""
+    fi
+
+    if ! $follow; then
+        echo -e "  ${DIM}Logs: forest logs | forest logs <service> | forest boot -f to follow${NC}"
+        echo ""
+    else
+        echo -e "  ${DIM}Following service logs (Ctrl+C to detach)...${NC}"
+        echo ""
+        tail -f "$log_dir"/*.log 2>/dev/null
+    fi
+}
+
+# ── Commands ─────────────────────────────────────────────────────────────────
+
+# forest doctor -- check requirements
+cmd_doctor() {
+    local main_root="$1"
+    local project_name
+    project_name="$(get_project_name "$main_root")"
+    local all_ok=true
+
+    print_header "forest doctor · ${project_name}"
+
+    check_one() {
+        local label="$1" check_cmd="$2" version_cmd="$3"
+        printf "  %-24s" "$label"
+        if eval "$check_cmd" &>/dev/null; then
+            local ver
+            ver="$(eval "$version_cmd" 2>/dev/null || echo "ok")"
+            printf "${GREEN}%-20s  ✓${NC}\n" "$ver"
+        else
+            printf "${RED}%-20s  ✗${NC}\n" "not found"
+            all_ok=false
+        fi
+    }
+
+    check_one "git" \
+        "command -v git" \
+        "git --version | sed 's/git version //'"
+
+    check_one "docker" \
+        "command -v docker" \
+        "docker --version | sed 's/Docker version //' | cut -d, -f1"
+
+    check_one "docker compose v2" \
+        "docker compose version" \
+        "docker compose version --short"
+
+    check_one "jq" \
+        "command -v jq" \
+        "jq --version"
+
+    check_one "docker daemon" \
+        "docker info" \
+        "echo running"
+
+    echo ""
+
+    # File checks
+    check_file() {
+        local label="$1" filepath="$2"
+        printf "  %-24s" "$label"
+        if [[ -f "$filepath" ]]; then
+            printf "${GREEN}%-20s  ✓${NC}\n" "found"
+        else
+            printf "${YELLOW}%-20s  ▹${NC}\n" "missing"
+            all_ok=false
+        fi
+    }
+
+    # Check forest config (auto-detects editor environment)
+    printf "  %-24s" "forest config"
+    local detected_config
+    if detected_config="$(find_config "$main_root")"; then
+        local relative="${detected_config#"$main_root"/}"
+        printf "${GREEN}%-20s  ✓${NC}\n" "$relative"
+    else
+        printf "${YELLOW}%-20s  ▹${NC}\n" "not found"
+        all_ok=false
+    fi
+
+    local compose_file
+    compose_file="$(config_get "$main_root" "compose-file" "docker-compose.yml")"
+    check_file "$compose_file" "$main_root/$compose_file"
+    check_file ".env" "$main_root/.env"
+
+    echo ""
+
+    if $all_ok; then
+        log_success "All checks passed"
+    else
+        log_warn "Some checks failed -- run ${BOLD}forest init${NC} to fix"
+    fi
+    echo ""
+}
+
+# forest init -- setup wizard
+cmd_init() {
+    local main_root="$1"
+    local project_name
+    project_name="$(basename "$main_root")"
+    # Detect existing config, or pick the right location for this editor
+    local config_file=""
+    config_file="$(find_config "$main_root" 2>/dev/null)" || true
+
+    print_header "forest init · setup wizard"
+
+    # Step 1: Requirements
+    log_info "Checking requirements..."
+    echo ""
+
+    local missing=()
+    command -v git &>/dev/null       || missing+=("git")
+    command -v docker &>/dev/null    || missing+=("docker")
+    docker compose version &>/dev/null || missing+=("docker compose v2")
+    command -v jq &>/dev/null        || missing+=("jq")
+
+    if (( ${#missing[@]} > 0 )); then
+        log_error "Missing requirements: ${missing[*]}"
+        log_info "Install them and try again"
+        return 1
+    fi
+
+    if ! docker info &>/dev/null; then
+        log_error "Docker daemon is not running"
+        return 1
+    fi
+
+    log_success "All requirements met"
+    echo ""
+
+    # Step 2: Project name
+    local current_name=""
+    if [[ -n "$config_file" && -f "$config_file" ]]; then
+        local prefix
+        prefix="$(config_prefix)"
+        current_name="$(jq -r "${prefix}.\"project-name\" // empty" "$config_file" 2>/dev/null || true)"
+    fi
+    local default_name="${current_name:-$project_name}"
+
+    read -rp "  Project name [$default_name]: " input_name
+    project_name="${input_name:-$default_name}"
+    log_success "Project: $project_name"
+    echo ""
+
+    # Step 3: Compose file
+    local compose_file=""
+    for candidate in docker-compose.yml docker-compose.yaml compose.yml compose.yaml; do
+        if [[ -f "$main_root/$candidate" ]]; then
+            compose_file="$candidate"
+            break
+        fi
+    done
+
+    if [[ -n "$compose_file" ]]; then
+        log_success "Found compose file: $compose_file"
+        read -rp "  Use this file? [Y/n]: " confirm
+        if [[ "$(lc "$confirm")" == "n" ]]; then
+            read -rp "  Compose file path: " compose_file
+        fi
+    else
+        log_warn "No docker-compose.yml found"
+        read -rp "  Compose file path (or press Enter to skip): " compose_file
+    fi
+    echo ""
+
+    # Step 4: Host services
+    local services_json="{}"
+    read -rp "  Do you run services on the host (not in Docker)? [y/N]: " has_services
+    if [[ "$(lc "$has_services")" == "y" ]]; then
+        echo ""
+        local adding=true
+        while $adding; do
+            local svc_key svc_label svc_cmd svc_port
+            read -rp "    Service key (short name, e.g. 'web'): " svc_key
+            [[ -z "$svc_key" ]] && break
+            read -rp "    Display label [$svc_key]: " svc_label
+            svc_label="${svc_label:-$svc_key}"
+            read -rp "    Command to run: " svc_cmd
+            read -rp "    Port (or Enter for none): " svc_port
+
+            local svc_obj
+            if [[ -n "$svc_port" ]]; then
+                svc_obj=$(jq -n --arg cmd "$svc_cmd" --arg label "$svc_label" --argjson port "$svc_port" \
+                    '{cmd: $cmd, label: $label, port: $port}')
+            else
+                svc_obj=$(jq -n --arg cmd "$svc_cmd" --arg label "$svc_label" \
+                    '{cmd: $cmd, label: $label}')
+            fi
+            services_json=$(echo "$services_json" | jq --arg k "$svc_key" --argjson v "$svc_obj" '. + {($k): $v}')
+
+            log_success "Added: $svc_label"
+            echo ""
+            read -rp "    Add another service? [y/N]: " more
+            [[ "$(lc "$more")" != "y" ]] && adding=false
+        done
+    fi
+    echo ""
+
+    # Step 5: Pre/post hooks
+    local pre_hooks="[]" post_hooks="[]"
+
+    # List available scripts as suggestions
+    local available_scripts=()
+    if [[ -d "$main_root/scripts" ]]; then
+        while IFS= read -r -d '' script; do
+            available_scripts+=("${script#"$main_root"/}")
+        done < <(find "$main_root/scripts" -name "*.sh" -type f -print0 2>/dev/null | sort -z)
+    fi
+
+    read -rp "  Any scripts to run BEFORE booting the stack? [y/N]: " has_pre
+    if [[ "$(lc "$has_pre")" == "y" ]]; then
+        if (( ${#available_scripts[@]} > 0 )); then
+            echo ""
+            log_info "Available scripts:"
+            for s in "${available_scripts[@]}"; do
+                echo -e "    ${DIM}$s${NC}"
+            done
+            echo ""
+        fi
+        local adding=true
+        while $adding; do
+            read -rp "    Script path (relative to project root): " hook_path
+            [[ -z "$hook_path" ]] && break
+            pre_hooks=$(echo "$pre_hooks" | jq --arg h "$hook_path" '. + [$h]')
+            log_success "Added pre-hook: $hook_path"
+            read -rp "    Add another? [y/N]: " more
+            [[ "$(lc "$more")" != "y" ]] && adding=false
+        done
+    fi
+
+    read -rp "  Any scripts to run AFTER booting the stack? [y/N]: " has_post
+    if [[ "$(lc "$has_post")" == "y" ]]; then
+        local adding=true
+        while $adding; do
+            read -rp "    Script path (relative to project root): " hook_path
+            [[ -z "$hook_path" ]] && break
+            post_hooks=$(echo "$post_hooks" | jq --arg h "$hook_path" '. + [$h]')
+            log_success "Added post-hook: $hook_path"
+            read -rp "    Add another? [y/N]: " more
+            [[ "$(lc "$more")" != "y" ]] && adding=false
+        done
+    fi
+    echo ""
+
+    # Step 6: URLs
+    local urls_json="{}"
+    read -rp "  Define dev environment URLs? [y/N]: " has_urls
+    if [[ "$(lc "$has_urls")" == "y" ]]; then
+        echo ""
+        local adding=true
+        while $adding; do
+            local url_label url_value
+            read -rp "    Label (e.g. 'App', 'API'): " url_label
+            [[ -z "$url_label" ]] && break
+            read -rp "    URL: " url_value
+            urls_json=$(echo "$urls_json" | jq --arg k "$url_label" --arg v "$url_value" '. + {($k): $v}')
+            log_success "Added: $url_label -> $url_value"
+            echo ""
+            read -rp "    Add another URL? [y/N]: " more
+            [[ "$(lc "$more")" != "y" ]] && adding=false
+        done
+    fi
+    echo ""
+
+    # Step 7: Branch pattern
+    local default_pattern='^(feat|feature|bugfix|fix|chore|hotfix)/([0-9]+)?-?(.+)$'
+    read -rp "  Branch pattern for issue detection [$default_pattern]: " branch_pattern
+    branch_pattern="${branch_pattern:-$default_pattern}"
+    echo ""
+
+    # Step 8: Write config
+    log_info "Writing configuration..."
+
+    local forest_config
+    forest_config=$(jq -n \
+        --arg pn "$project_name" \
+        --arg cf "$compose_file" \
+        --argjson pre "$pre_hooks" \
+        --argjson post "$post_hooks" \
+        --argjson svcs "$services_json" \
+        --argjson urls "$urls_json" \
+        --arg bp "$branch_pattern" \
+        '{
+            "project-name": $pn,
+            "compose-file": $cf,
+            "hooks": { "pre": $pre, "post": $post },
+            "services": $svcs,
+            "urls": $urls,
+            "branch-pattern": $bp
+        }')
+
+    # Determine where to write config
+    if [[ -z "$config_file" ]]; then
+        # No existing config -- detect editor environment
+        if [[ -d "$main_root/.cursor" ]]; then
+            config_file="$main_root/.cursor/worktrees.json"
+        elif [[ -d "$main_root/.claude" ]]; then
+            config_file="$main_root/.claude/settings.json"
+        else
+            # Standalone -- use .forest/config.json
+            config_file="$main_root/.forest/config.json"
+        fi
+    fi
+
+    mkdir -p "$(dirname "$config_file")"
+    local relative="${config_file#"$main_root"/}"
+
+    if [[ "$config_file" == *".forest/config.json" ]]; then
+        # Standalone: config at root level (no nesting under "forest" key)
+        echo "$forest_config" | jq '.' > "$config_file"
+    elif [[ -f "$config_file" ]]; then
+        # Merge into existing editor config file
+        local existing
+        existing="$(cat "$config_file")"
+        echo "$existing" | jq --argjson forest "$forest_config" '.forest = $forest' > "$config_file"
+    else
+        # Create new editor config file
+        jq -n --argjson forest "$forest_config" '{forest: $forest}' > "$config_file"
+    fi
+
+    log_success "Config written to ${relative}"
+    echo ""
+
+    # Step 9: Global install
+    local script_path
+    script_path="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+    local install_target="$HOME/.local/bin/forest"
+
+    if [[ -L "$install_target" ]] && [[ "$(readlink "$install_target")" == "$script_path" ]]; then
+        log_success "Already installed globally at $install_target"
+    else
+        read -rp "  Install globally to ~/.local/bin/forest? [Y/n]: " do_install
+        if [[ "$(lc "$do_install")" != "n" ]]; then
+            mkdir -p "$HOME/.local/bin"
+            ln -sf "$script_path" "$install_target"
+            log_success "Installed: $install_target -> $script_path"
+
+            # Check if ~/.local/bin is in PATH
+            if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+                log_warn "$HOME/.local/bin is not in your PATH"
+                log_info "Add this to your ~/.zshrc:  export PATH=\"\$HOME/.local/bin:\$PATH\""
+            fi
+        fi
+    fi
+
+    echo ""
+    print_sep
+    echo ""
+    log_success "Setup complete! Run ${BOLD}forest${NC} to get started."
+    echo ""
+}
+
+# forest list -- show worktrees
+cmd_list() {
+    local main_root="$1"
+    local project_name
+    project_name="$(get_project_name "$main_root")"
+
+    discover_worktrees "$main_root"
+
+    if (( ${#WT_NAMES[@]} == 0 )); then
+        print_header "forest · ${project_name}"
+        log_warn "No worktrees found"
+        return 0
+    fi
+
+    show_menu "$project_name"
+}
+
+# forest boot [name] [-f] -- boot a worktree
+cmd_boot() {
+    local main_root="$1"
+    local name="${2:-}"
+    local follow="${3:-false}"
+    local project_name
+    project_name="$(get_project_name "$main_root")"
+
+    # Check .env exists (in main root or worktree -- checked again at boot time)
+    if [[ ! -f "$main_root/.env" ]]; then
+        log_warn "No .env in project root ($main_root) -- worktree .env will be used if present"
+    fi
+
+    discover_worktrees "$main_root"
+
+    if (( ${#WT_NAMES[@]} == 0 )); then
+        log_error "No worktrees found"
+        return 1
+    fi
+
+    local idx
+
+    # If only main exists (no worktrees), skip menu
+    if (( ${#WT_NAMES[@]} == 1 )); then
+        idx=0
+        log_info "Only one workspace available, booting ${BOLD}${WT_NAMES[0]}${NC}"
+    else
+        idx="$(pick_worktree "$main_root" "$name")" || return 1
+    fi
+
+    # Stop existing environment if running
+    if [[ -f "$main_root/.forest/active.json" ]]; then
+        local active_name
+        active_name="$(jq -r '.worktree_name' "$main_root/.forest/active.json" 2>/dev/null || echo "")"
+        if [[ "${WT_NAMES[$idx]}" == "$active_name" ]]; then
+            log_warn "${active_name} is already running"
+            read -rp "  Restart it? [Y/n]: " restart
+            if [[ "$(lc "$restart")" == "n" ]]; then
+                return 0
+            fi
+        fi
+        do_stop "$main_root"
+    fi
+
+    do_boot "$main_root" "$idx" "$follow"
+}
+
+# forest stop -- stop active environment
+cmd_stop() {
+    local main_root="$1"
+    do_stop "$main_root"
+}
+
+# forest switch [name] [-f] -- pick first, then stop + boot
+cmd_switch() {
+    local main_root="$1"
+    local name="${2:-}"
+    local follow="${3:-false}"
+
+    # Resolve target BEFORE stopping so the picker is shown while
+    # the current stack is still running (better UX).
+    discover_worktrees "$main_root"
+
+    if (( ${#WT_NAMES[@]} == 0 )); then
+        log_error "No worktrees found"
+        return 1
+    fi
+
+    local idx
+    if (( ${#WT_NAMES[@]} == 1 )); then
+        idx=0
+    else
+        idx="$(pick_worktree "$main_root" "$name")" || return 1
+    fi
+
+    # Now stop the current environment
+    if [[ -f "$main_root/.forest/active.json" ]]; then
+        do_stop "$main_root"
+    fi
+
+    # Boot the selected worktree by name (cmd_boot re-discovers)
+    cmd_boot "$main_root" "${WT_NAMES[$idx]}" "$follow"
+}
+
+# forest status -- show status
+cmd_status() {
+    local main_root="$1"
+    local project_name
+    project_name="$(get_project_name "$main_root")"
+
+    print_header "forest status · ${project_name}"
+
+    if [[ ! -f "$main_root/.forest/active.json" ]]; then
+        log_info "No active environment"
+        echo ""
+        return 0
+    fi
+
+    local wt_name wt_branch workspace_root project_n
+    wt_name="$(jq -r '.worktree_name' "$main_root/.forest/active.json")"
+    wt_branch="$(jq -r '.worktree_branch' "$main_root/.forest/active.json")"
+    workspace_root="$(jq -r '.worktree_path' "$main_root/.forest/active.json")"
+    project_n="$(jq -r '.project_name' "$main_root/.forest/active.json")"
+
+    echo -e "  Workspace:  ${BOLD}${wt_name}${NC} ${DIM}(${wt_branch})${NC}"
+    echo -e "  Path:       ${DIM}${workspace_root}${NC}"
+    echo ""
+
+    # Docker compose status
+    log_info "Docker Compose services:"
+    echo ""
+
+    local compose_file
+    compose_file="$(config_get "$main_root" "compose-file" "docker-compose.yml")"
+
+    local env_file
+    env_file="$(resolve_env_file "$workspace_root" "$main_root")"
+
+    docker compose \
+        --env-file "$env_file" \
+        --project-directory "$workspace_root" \
+        -f "$workspace_root/$compose_file" \
+        -p "$project_n" \
+        ps --format "table {{.Name}}\t{{.Status}}\t{{.Ports}}" 2>/dev/null | \
+        sed 's/^/    /' || log_warn "Could not get container status"
+
+    echo ""
+
+    # Host services status
+    local service_pids
+    service_pids="$(jq -r '.service_pids // {} | to_entries[] | "\(.key):\(.value)"' "$main_root/.forest/active.json" 2>/dev/null || true)"
+    if [[ -n "$service_pids" ]]; then
+        log_info "Host services:"
+        echo ""
+        while IFS=: read -r svc_key svc_pid; do
+            local svc_label
+            svc_label="$(config_jq "$main_root" ".services.\"$svc_key\".label // \"$svc_key\"")"
+            svc_label="${svc_label:-$svc_key}"
+            if kill -0 "$svc_pid" 2>/dev/null; then
+                echo -e "    ${GREEN}●${NC} ${svc_label} ${DIM}(PID: ${svc_pid})${NC}"
+            else
+                echo -e "    ${RED}●${NC} ${svc_label} ${DIM}(PID: ${svc_pid} - stopped)${NC}"
+            fi
+        done <<< "$service_pids"
+        echo ""
+    fi
+
+    # Print URLs
+    local urls_json
+    urls_json="$(config_jq "$main_root" '.urls // {} | to_entries[] | "  \(.key): \(.value)"')"
+    if [[ -n "$urls_json" ]]; then
+        log_info "URLs:"
+        while IFS= read -r url_line; do
+            echo "  $url_line"
+        done <<< "$urls_json"
+        echo ""
+    fi
+}
+
+# forest logs [service] -- tail logs
+cmd_logs() {
+    local main_root="$1"
+    local service="${2:-}"
+
+    if [[ ! -f "$main_root/.forest/active.json" ]]; then
+        log_error "No active environment"
+        return 1
+    fi
+
+    local workspace_root project_name
+    workspace_root="$(jq -r '.worktree_path' "$main_root/.forest/active.json")"
+    project_name="$(jq -r '.project_name' "$main_root/.forest/active.json")"
+
+    local compose_file
+    compose_file="$(config_get "$main_root" "compose-file" "docker-compose.yml")"
+
+    local log_dir="$main_root/.forest/logs"
+
+    # Check if it's a host service (has a log file)
+    if [[ -n "$service" && -f "$log_dir/$service.log" ]]; then
+        log_info "Tailing host service: ${BOLD}${service}${NC}"
+        tail -f "$log_dir/$service.log"
+    elif [[ -n "$service" ]]; then
+        # Docker compose service
+        local env_file
+        env_file="$(resolve_env_file "$workspace_root" "$main_root")"
+
+        docker compose \
+            --env-file "$env_file" \
+            --project-directory "$workspace_root" \
+            -f "$workspace_root/$compose_file" \
+            -p "$project_name" \
+            logs -f "$service"
+    else
+        # All logs -- combine docker + host
+        if [[ -d "$log_dir" ]] && ls "$log_dir"/*.log &>/dev/null; then
+            log_info "Tailing all logs (docker + host services). Ctrl+C to stop."
+            echo ""
+            # Tail host logs and docker logs together
+            tail -f "$log_dir"/*.log &
+            local tail_pid=$!
+            # shellcheck disable=SC2064  # intentional: capture PID at definition time
+            trap "kill $tail_pid 2>/dev/null; return 0" INT
+        fi
+        local env_file
+        env_file="$(resolve_env_file "$workspace_root" "$main_root")"
+
+        docker compose \
+            --env-file "$env_file" \
+            --project-directory "$workspace_root" \
+            -f "$workspace_root/$compose_file" \
+            -p "$project_name" \
+            logs -f
+    fi
+}
+
+# forest cleanup [name] -- teardown resources
+cmd_cleanup() {
+    local main_root="$1"
+    local name="${2:-}"
+    local project_name
+    project_name="$(get_project_name "$main_root")"
+
+    discover_worktrees "$main_root"
+
+    print_header "forest cleanup · ${project_name}"
+
+    local idx
+    idx="$(pick_worktree "$main_root" "$name")" || return 1
+
+    local wt_name="${WT_NAMES[$idx]}"
+    local wt_path="${WT_PATHS[$idx]}"
+
+    echo -e "  This will stop the stack and remove Docker volumes for: ${BOLD}${wt_name}${NC}"
+    read -rp "  Are you sure? [y/N]: " confirm
+    if [[ "$(lc "$confirm")" != "y" ]]; then
+        log_info "Cancelled"
+        return 0
+    fi
+
+    # Stop if active
+    if [[ -f "$main_root/.forest/active.json" ]]; then
+        local active_name
+        active_name="$(jq -r '.worktree_name' "$main_root/.forest/active.json" 2>/dev/null || echo "")"
+        if [[ "$active_name" == "$wt_name" ]]; then
+            do_stop "$main_root"
+        fi
+    fi
+
+    # Docker compose down with volumes
+    local compose_file
+    compose_file="$(config_get "$main_root" "compose-file" "docker-compose.yml")"
+
+    if [[ -f "$wt_path/$compose_file" ]]; then
+        local env_file
+        env_file="$(resolve_env_file "$wt_path" "$main_root")"
+
+        docker compose \
+            --env-file "$env_file" \
+            --project-directory "$wt_path" \
+            -f "$wt_path/$compose_file" \
+            -p "$project_name" \
+            down -v 2>/dev/null || true
+    fi
+
+    log_success "Cleaned up: $wt_name"
+    echo ""
+}
+
+# ── Shared: resolve or pick worktree ──────────────────────────────────────────
+
+# Resolve a worktree by name, or show interactive picker if no name given.
+# Usage: pick_worktree <main_root> [name]
+# Prints the selected index to stdout. All UI goes to stderr.
+pick_worktree() {
+    local main_root="$1"
+    local name="${2:-}"
+    local project_name
+    project_name="$(get_project_name "$main_root")"
+
+    if [[ -n "$name" ]]; then
+        # Numeric argument → treat as index first
+        if [[ "$name" =~ ^[0-9]+$ ]] && (( name >= 0 && name < ${#WT_NAMES[@]} )); then
+            echo "$name"
+        else
+            find_worktree_by_name "$name" || {
+                log_error "Worktree not found: $name" >&2
+                echo "" >&2
+                show_menu "$project_name" >&2
+                return 1
+            }
+        fi
+    else
+        prompt_worktree "$project_name" || return 1
+    fi
+}
+
+# forest label <name> <label> -- set a manual label for a worktree
+cmd_label() {
+    local main_root="$1"
+    local name="${2:-}"
+    local label="${3:-}"
+
+    discover_worktrees "$main_root"
+
+    local idx
+    idx="$(pick_worktree "$main_root" "$name")" || return 1
+    local wt_name="${WT_NAMES[$idx]}"
+
+    if [[ -z "$label" ]]; then
+        # Show current label and prompt
+        local current_label
+        current_label="$(meta_get "$main_root" "$wt_name" "label")"
+        local current_branch
+        current_branch="$(meta_get "$main_root" "$wt_name" "branch")"
+
+        if [[ -n "$current_label" ]]; then
+            log_info "Current label for ${BOLD}${wt_name}${NC}: $current_label"
+        elif [[ -n "$current_branch" ]]; then
+            log_info "Saved branch for ${BOLD}${wt_name}${NC}: $current_branch (no custom label)"
+        fi
+
+        read -rp "  Label for ${wt_name}: " label
+        if [[ -z "$label" ]]; then
+            log_info "No label set"
+            return 0
+        fi
+    fi
+
+    meta_set "$main_root" "$wt_name" "label" "$label"
+    log_success "Labeled ${BOLD}${wt_name}${NC} as: $label"
+}
+
+# ── Help ─────────────────────────────────────────────────────────────────────
+
+cmd_help() {
+    echo ""
+    echo -e "  ${BOLD}forest${NC} v${VERSION} -- dev workspace switcher for git worktrees"
+    echo ""
+    echo -e "  ${BOLD}Usage:${NC} forest [command] [args]"
+    echo ""
+    echo -e "  ${BOLD}Commands:${NC}"
+    echo -e "    ${CYAN}init${NC}              Setup wizard -- configure project"
+    echo -e "    ${CYAN}doctor${NC}            Check all requirements"
+    echo -e "    ${CYAN}list${NC}              List worktrees with branch/issue info"
+    echo -e "    ${CYAN}boot${NC}   [name]     Boot dev stack for a worktree"
+    echo -e "    ${CYAN}stop${NC}              Stop the active dev stack"
+    echo -e "    ${CYAN}switch${NC} [name]     Stop current + boot another"
+    echo -e "    ${CYAN}status${NC}            Show running state"
+    echo -e "    ${CYAN}logs${NC}   [service]  Tail logs (docker + host services)"
+    echo -e "    ${CYAN}label${NC}  [name] [l]  Set a label for a worktree"
+    echo -e "    ${CYAN}cleanup${NC} [name]    Tear down resources (volumes, etc.)"
+    echo -e "    ${CYAN}help${NC}              Show this help"
+    echo ""
+    echo -e "  ${BOLD}Options:${NC}"
+    echo -e "    -f, --follow      Follow service logs after boot/switch"
+    echo -e "    --project <path>  Specify project root explicitly"
+    echo -e "    --version         Show version"
+    echo ""
+    echo -e "  ${BOLD}Examples:${NC}"
+    echo -e "    forest                     Interactive boot menu"
+    echo -e "    forest boot 1              Boot worktree by index"
+    echo -e "    forest switch atf -f       Switch to 'atf' and follow logs"
+    echo -e "    forest logs web            Tail host service logs (e.g. Vite)"
+    echo -e "    forest logs postgres       Tail postgres docker logs"
+    echo -e "    forest label 1 my-feature  Label worktree #1"
+    echo ""
+    echo -e "  ${DIM}Service output goes to .forest/logs/ by default.${NC}"
+    echo -e "  ${DIM}Use -f/--follow to stream logs after boot, or 'forest logs' anytime.${NC}"
+    echo ""
+}
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+
+main() {
+    local project_override=""
+    local command=""
+    local follow=false
+    local args=()
+
+    # Parse global flags and command args
+    while (( $# > 0 )); do
+        case "$1" in
+            --project)
+                project_override="$2"
+                shift 2
+                ;;
+            --version)
+                echo "forest v${VERSION}"
+                return 0
+                ;;
+            --help|-h)
+                cmd_help
+                return 0
+                ;;
+            -f|--follow)
+                follow=true
+                shift
+                ;;
+            -*)
+                log_error "Unknown option: $1"
+                cmd_help
+                return 1
+                ;;
+            *)
+                if [[ -z "$command" ]]; then
+                    command="$1"
+                else
+                    args+=("$1")
+                fi
+                shift
+                ;;
+        esac
+    done
+
+    # Find project root
+    local project_root
+    if [[ -n "$project_override" ]]; then
+        project_root="$project_override"
+    else
+        # shellcheck disable=SC2119  # uses default $PWD when called without args
+        project_root="$(find_project_root)" || {
+            log_error "Not inside a git repository"
+            log_info "Run from a project directory or use --project <path>"
+            return 1
+        }
+    fi
+
+    local main_root
+    main_root="$(find_main_root "$project_root")" || {
+        log_error "Could not determine main worktree"
+        return 1
+    }
+
+    # Dispatch commands
+    case "${command:-boot}" in
+        init)
+            cmd_init "$main_root"
+            ;;
+        doctor|check)
+            cmd_doctor "$main_root"
+            ;;
+        list|ls)
+            cmd_list "$main_root"
+            ;;
+        boot|start|"")
+            cmd_boot "$main_root" "${args[0]:-}" "$follow"
+            ;;
+        stop)
+            cmd_stop "$main_root"
+            ;;
+        switch|sw)
+            cmd_switch "$main_root" "${args[0]:-}" "$follow"
+            ;;
+        status|st)
+            cmd_status "$main_root"
+            ;;
+        logs|log)
+            cmd_logs "$main_root" "${args[0]:-}"
+            ;;
+        label|tag)
+            cmd_label "$main_root" "${args[0]:-}" "${args[1]:-}"
+            ;;
+        cleanup|clean)
+            cmd_cleanup "$main_root" "${args[0]:-}"
+            ;;
+        help)
+            cmd_help
+            ;;
+        *)
+            log_error "Unknown command: $command"
+            cmd_help
+            return 1
+            ;;
+    esac
+}
+
+main "$@"

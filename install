@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# ─────────────────────────────────────────────────────────────────────────────
+# forest installer
+#
+# Usage:
+#   curl -fsSL https://raw.githubusercontent.com/prbdias/forest-cli/main/install | bash
+#
+# Options (via env vars):
+#   FOREST_DIR    — Where to clone forest (default: ~/.forest-cli)
+#   FOREST_BIN    — Where to symlink the binary (default: ~/.local/bin/forest)
+#   FOREST_BRANCH — Git branch to install (default: main)
+# ─────────────────────────────────────────────────────────────────────────────
+set -euo pipefail
+
+# ── Config ───────────────────────────────────────────────────────────────────
+
+FOREST_DIR="${FOREST_DIR:-$HOME/.forest-cli}"
+FOREST_BIN="${FOREST_BIN:-$HOME/.local/bin/forest}"
+FOREST_BRANCH="${FOREST_BRANCH:-main}"
+REPO_URL="https://github.com/prbdias/forest-cli.git"
+
+# ── Colors ───────────────────────────────────────────────────────────────────
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+BOLD='\033[1m'
+DIM='\033[2m'
+NC='\033[0m'
+
+info()    { echo -e "  ${BLUE}▸${NC} $1"; }
+success() { echo -e "  ${GREEN}✓${NC} $1"; }
+warn()    { echo -e "  ${YELLOW}▹${NC} $1"; }
+error()   { echo -e "  ${RED}✗${NC} $1"; exit 1; }
+
+# ── Checks ───────────────────────────────────────────────────────────────────
+
+echo ""
+echo -e "  ${BOLD}🌲 forest installer${NC}"
+echo ""
+
+# Check git
+command -v git &>/dev/null || error "git is required but not found"
+
+# Check dependencies
+missing_deps=()
+command -v docker &>/dev/null    || missing_deps+=("docker")
+command -v jq &>/dev/null        || missing_deps+=("jq")
+
+if (( ${#missing_deps[@]} > 0 )); then
+    warn "Optional dependencies not found: ${missing_deps[*]}"
+    warn "forest needs these at runtime — install them before using forest"
+    echo ""
+fi
+
+# ── Install ──────────────────────────────────────────────────────────────────
+
+# Clone or update
+if [[ -d "$FOREST_DIR" ]]; then
+    info "Updating existing installation..."
+    git -C "$FOREST_DIR" fetch origin "$FOREST_BRANCH" --quiet 2>/dev/null
+    git -C "$FOREST_DIR" checkout "$FOREST_BRANCH" --quiet 2>/dev/null
+    git -C "$FOREST_DIR" pull origin "$FOREST_BRANCH" --quiet 2>/dev/null
+    success "Updated to latest"
+else
+    info "Cloning forest..."
+    git clone --depth 1 --branch "$FOREST_BRANCH" "$REPO_URL" "$FOREST_DIR" --quiet
+    success "Cloned to $FOREST_DIR"
+fi
+
+# Make executable
+chmod +x "$FOREST_DIR/forest"
+
+# Create symlink
+mkdir -p "$(dirname "$FOREST_BIN")"
+ln -sf "$FOREST_DIR/forest" "$FOREST_BIN"
+success "Linked: $FOREST_BIN → $FOREST_DIR/forest"
+
+# ── PATH check ───────────────────────────────────────────────────────────────
+
+BIN_DIR="$(dirname "$FOREST_BIN")"
+if [[ ":$PATH:" != *":$BIN_DIR:"* ]]; then
+    echo ""
+    warn "$BIN_DIR is not in your PATH"
+    echo ""
+
+    # Detect shell config file
+    shell_rc=""
+    case "${SHELL:-}" in
+        */zsh)  shell_rc="$HOME/.zshrc" ;;
+        */bash) shell_rc="$HOME/.bashrc" ;;
+        *)      shell_rc="$HOME/.profile" ;;
+    esac
+
+    echo -e "  Add this to ${BOLD}${shell_rc}${NC}:"
+    echo ""
+    echo -e "    ${DIM}export PATH=\"$BIN_DIR:\$PATH\"${NC}"
+    echo ""
+fi
+
+# ── Verify ───────────────────────────────────────────────────────────────────
+
+echo ""
+if "$FOREST_BIN" --version &>/dev/null; then
+    installed_version="$("$FOREST_BIN" --version 2>/dev/null)"
+    success "Installed: ${BOLD}${installed_version}${NC}"
+else
+    success "Installed: ${BOLD}forest${NC} (restart your shell to use)"
+fi
+
+echo ""
+echo -e "  ${BOLD}Next steps:${NC}"
+echo -e "    1. ${DIM}cd ~/your-project${NC}"
+echo -e "    2. ${DIM}forest init${NC}        # setup wizard"
+echo -e "    3. ${DIM}forest${NC}             # interactive boot menu"
+echo ""
+echo -e "  ${DIM}Docs: https://github.com/prbdias/forest-cli${NC}"
+echo ""

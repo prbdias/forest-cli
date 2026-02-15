@@ -1,0 +1,28 @@
+{
+  "setup-worktree-unix": [
+    "pnpm install --frozen-lockfile",
+    "cp $ROOT_WORKTREE_PATH/.env .env"
+  ],
+  "forest": {
+    "project-name": "my-app",
+    "compose-file": "docker-compose.yml",
+    "hooks": {
+      "pre": [],
+      "pre-services": ["pnpm install --frozen-lockfile"],
+      "post": []
+    },
+    "services": {
+      "web": {
+        "cmd": "cd frontend && npx vite --port 5173 --host",
+        "label": "Frontend (Vite HMR)",
+        "port": 5173
+      }
+    },
+    "urls": {
+      "App": "http://localhost:3000",
+      "API": "http://localhost:3001",
+      "Vite (direct)": "http://localhost:5173"
+    },
+    "branch-pattern": "^(feat|feature|bugfix|fix|chore|hotfix)/(\\d+)?-?(.+)$"
+  }
+}
